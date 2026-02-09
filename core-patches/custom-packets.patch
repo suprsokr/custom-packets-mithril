@@ -1,0 +1,1322 @@
+diff --git a/src/server/game/Scripting/ScriptMgr.cpp b/src/server/game/Scripting/ScriptMgr.cpp
+index e1f23a2..f73687b 100644
+--- a/src/server/game/Scripting/ScriptMgr.cpp
++++ b/src/server/game/Scripting/ScriptMgr.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "ScriptMgr.h"
+ #include "ChatCommand.h"
++#include "CustomPacketRead.h"
+ #include "Config.h"
+ #include "Creature.h"
+ #include "CreatureAIImpl.h"
+@@ -1308,6 +1309,17 @@ void ScriptMgr::OnPacketSend(WorldSession* session, WorldPacket const& packet)
+     FOREACH_SCRIPT(ServerScript)->OnPacketSend(session, copy);
+ }
+ 
++// Custom Packets (Thorium)
++void ScriptMgr::OnCustomPacketReceive(Player* player, uint16 opcode, CustomPacketRead* packet)
++{
++    ASSERT(player);
++
++    if (SCR_REG_LST(ServerScript).empty())
++        return;
++
++    FOREACH_SCRIPT(ServerScript)->OnCustomPacketReceive(player, opcode, packet);
++}
++
+ void ScriptMgr::OnOpenStateChange(bool open)
+ {
+     FOREACH_SCRIPT(WorldScript)->OnOpenStateChange(open);
+diff --git a/src/server/game/Scripting/ScriptMgr.h b/src/server/game/Scripting/ScriptMgr.h
+index c50e63e..aad73c0 100644
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -61,6 +61,7 @@ class Weather;
+ class WorldPacket;
+ class WorldSocket;
+ class WorldObject;
++class CustomPacketRead;
+ class WorldSession;
+ 
+ struct AreaTriggerEntry;
+@@ -227,6 +228,9 @@ class TC_GAME_API ServerScript : public ScriptObject
+         // Called when a (valid) packet is received by a client. The packet object is a copy of the original packet, so
+         // reading and modifying it is safe. Make sure to check WorldSession pointer before usage, it might be null in case of auth packets
+         virtual void OnPacketReceive(WorldSession* session, WorldPacket& packet);
++
++        // Called when a custom packet is received from a client addon (Thorium)
++        virtual void OnCustomPacketReceive(Player* /*player*/, uint16 /*opcode*/, CustomPacketRead* /*packet*/) { }
+ };
+ 
+ class TC_GAME_API WorldScript : public ScriptObject
+@@ -888,6 +892,7 @@ class TC_GAME_API ScriptMgr
+         void OnSocketClose(std::shared_ptr<WorldSocket> const& socket);
+         void OnPacketReceive(WorldSession* session, WorldPacket const& packet);
+         void OnPacketSend(WorldSession* session, WorldPacket const& packet);
++        void OnCustomPacketReceive(Player* player, uint16 opcode, CustomPacketRead* packet); // Thorium
+ 
+     public: /* WorldScript */
+ 
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketBase.cpp b/src/server/game/Server/CustomPackets/CustomPacketBase.cpp
+new file mode 100644
+index 0000000..e26931c
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketBase.cpp
+@@ -0,0 +1,254 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#include "CustomPacketBase.h"
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++
++CustomPacketBase::CustomPacketBase(CustomPacketBase const& base)
++    : m_size(base.m_size)
++    , m_maxChunkSize(base.m_maxChunkSize)
++    , m_idx(0)
++    , m_global_idx(0)
++    , m_chunk(0)
++    , m_chunks(base.m_chunks)
++    , m_opcode(base.m_opcode)
++{
++}
++
++CustomPacketBase::CustomPacketBase()
++    : m_size(0)
++    , m_maxChunkSize(0)
++    , m_idx(0)
++    , m_global_idx(0)
++    , m_chunk(0)
++    , m_opcode(0)
++{
++}
++
++CustomPacketBase::CustomPacketBase(opcode_t opcode, chunkSize_t maxChunkSize, totalSize_t initialSize)
++    : m_size(0)
++    , m_idx(0)
++    , m_global_idx(0)
++    , m_chunk(0)
++    , m_maxChunkSize(maxChunkSize)
++    , m_opcode(opcode)
++{
++    if (maxChunkSize <= CustomHeaderSize)
++    {
++        throw std::runtime_error(
++            "Maximum chunk size (" + std::to_string(maxChunkSize) +
++            ") is <= message header size (" + std::to_string(CustomHeaderSize) +
++            "), you can't send any messages!"
++        );
++    }
++
++    if (initialSize > 0)
++    {
++        Increase(initialSize);
++    }
++}
++
++std::vector<CustomPacketChunk>& CustomPacketBase::buildMessages()
++{
++    for (chunkCount_t i = 0; i < m_chunks.size(); ++i)
++    {
++        CustomPacketChunk& chnk = m_chunks[i];
++        CustomPacketHeader* hdr = chnk.Header();
++        hdr->opcode = m_opcode;
++        hdr->fragmentId = i;
++        hdr->totalFrags = static_cast<chunkCount_t>(m_chunks.size());
++    }
++    return m_chunks;
++}
++
++void CustomPacketBase::Reset()
++{
++    m_chunk = 0;
++    m_idx = 0;
++    m_global_idx = 0;
++    m_size = 0;
++}
++
++void CustomPacketBase::Destroy()
++{
++    for (auto& chunk : m_chunks)
++    {
++        chunk.Destroy();
++    }
++    m_chunks.clear();
++    Reset();
++}
++
++void CustomPacketBase::Push(CustomPacketChunk& chnk)
++{
++    m_size += chnk.Size();
++    m_chunks.push_back(chnk);
++}
++
++totalSize_t CustomPacketBase::Size()
++{
++    return m_size;
++}
++
++CustomPacketChunk* CustomPacketBase::Chunk(chunkCount_t index)
++{
++    return &m_chunks[index];
++}
++
++chunkSize_t CustomPacketBase::ChunkSize(chunkCount_t index)
++{
++    return m_chunks[index].Size();
++}
++
++chunkCount_t CustomPacketBase::ChunkCount()
++{
++    return static_cast<chunkCount_t>(m_chunks.size());
++}
++
++opcode_t CustomPacketBase::Opcode()
++{
++    return m_opcode;
++}
++
++chunkSize_t CustomPacketBase::MaxWritableChunkSize()
++{
++    return m_maxChunkSize - CustomHeaderSize;
++}
++
++void CustomPacketBase::Increase(totalSize_t increase)
++{
++    if (m_chunks.size() > 0)
++    {
++        CustomPacketChunk& chnk = m_chunks[m_chunks.size() - 1];
++        chunkSize_t inc = static_cast<chunkSize_t>(std::min(
++            static_cast<uint32_t>(chnk.Size() + increase),
++            static_cast<uint32_t>(MaxWritableChunkSize())
++        ));
++        if (inc > 0)
++        {
++            chnk.Increase(inc);
++        }
++    }
++
++    totalSize_t newSize = m_size + increase;
++    chunkCount_t firstNewChunk = static_cast<chunkCount_t>(m_chunks.size());
++    m_chunks.resize(
++        static_cast<chunkCount_t>(std::ceil(static_cast<double>(newSize) / static_cast<double>(MaxWritableChunkSize())))
++    );
++    chunkCount_t remInc = static_cast<chunkCount_t>(newSize);
++    for (chunkCount_t i = firstNewChunk; i < m_chunks.size(); ++i)
++    {
++        chunkSize_t size = (i == (m_chunks.size() - 1))
++            ? remInc
++            : MaxWritableChunkSize();
++        remInc -= size;
++        m_chunks[i] = CustomPacketChunk(size);
++    }
++    m_size = newSize;
++}
++
++void CustomPacketBase::WriteBytes(totalSize_t size, char const* bytes)
++{
++    while (size > 0)
++    {
++        if (m_chunk >= m_chunks.size())
++        {
++            chunkSize_t inc = static_cast<chunkSize_t>(
++                std::min(static_cast<uint32_t>(size), static_cast<uint32_t>(MaxWritableChunkSize()))
++            );
++            m_size += inc;
++            m_chunks.push_back(CustomPacketChunk(inc));
++        }
++        else if (m_idx == MaxWritableChunkSize())
++        {
++            m_chunk++;
++            m_idx = 0;
++            continue;
++        }
++
++        CustomPacketChunk& chnk = m_chunks[m_chunk];
++        if (size >= chnk.RemBytes(m_idx))
++        {
++            totalSize_t inc = std::min(
++                static_cast<uint32_t>(size - chnk.RemBytes(m_idx)),
++                static_cast<uint32_t>(MaxWritableChunkSize() - chnk.Size())
++            );
++            chnk.Increase(static_cast<chunkSize_t>(inc));
++            m_size += inc;
++        }
++
++        totalSize_t written = static_cast<chunkSize_t>(
++            std::min(static_cast<totalSize_t>(chnk.RemBytes(m_idx)), size)
++        );
++
++        chnk.WriteBytes(m_idx, static_cast<chunkSize_t>(written), bytes);
++        bytes += written;
++        size -= written;
++        if (size == 0)
++        {
++            incIdx(static_cast<chunkSize_t>(written));
++        }
++        else
++        {
++            m_idx = 0;
++            ++m_chunk;
++        }
++    }
++}
++
++void CustomPacketBase::ReadBytes(totalSize_t size, char* bytes)
++{
++    if (m_size - m_global_idx < size)
++    {
++        return;
++    }
++    totalSize_t offset = 0;
++    while (size > 0)
++    {
++        if (m_chunk >= m_chunks.size()) break;
++        CustomPacketChunk& chunk = m_chunks[m_chunk];
++        chunkSize_t read = static_cast<chunkSize_t>(std::min(
++            size,
++            static_cast<totalSize_t>(chunk.RemBytes(m_idx))
++        ));
++        chunk.ReadBytes(m_idx, read, bytes + offset);
++        size -= read;
++        offset += read;
++        if (size == 0)
++        {
++            incIdx(read);
++        }
++        else
++        {
++            m_idx = 0;
++            ++m_chunk;
++        }
++    }
++}
++
++char* CustomPacketBase::ReadBytes(totalSize_t size, bool padStr)
++{
++    if (m_size - m_global_idx < size)
++    {
++        return nullptr;
++    }
++    char* c = new char[size + (padStr ? 1 : 0)];
++    ReadBytes(size, c);
++    return c;
++}
++
++void CustomPacketBase::Clear()
++{
++    m_chunks.clear();
++    Reset();
++}
++
++void CustomPacketBase::incIdx(chunkSize_t amount)
++{
++    m_idx += amount;
++    m_global_idx += amount;
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketBase.h b/src/server/game/Server/CustomPackets/CustomPacketBase.h
+new file mode 100644
+index 0000000..fdaeafa
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketBase.h
+@@ -0,0 +1,74 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_BASE_H
++#define CUSTOM_PACKET_BASE_H
++
++#include "CustomPacketChunk.h"
++#include "CustomPacketDefines.h"
++#include <vector>
++#include <cmath>
++
++class CustomPacketBase
++{
++public:
++    CustomPacketBase(CustomPacketBase const& base);
++    CustomPacketBase();
++    CustomPacketBase(opcode_t opcode, chunkSize_t maxChunkSize, totalSize_t initialSize);
++
++    std::vector<CustomPacketChunk>& buildMessages();
++
++    void Reset();
++    void Destroy();
++    void Clear();
++
++    void Push(CustomPacketChunk& chnk);
++    totalSize_t Size();
++    CustomPacketChunk* Chunk(chunkCount_t index);
++    chunkSize_t ChunkSize(chunkCount_t index);
++    chunkCount_t ChunkCount();
++
++    opcode_t Opcode();
++
++protected:
++    chunkSize_t MaxWritableChunkSize();
++
++    void Increase(totalSize_t increase);
++
++    template <typename T>
++    void Write(T value)
++    {
++        WriteBytes(sizeof(value), reinterpret_cast<char const*>(&value));
++    }
++
++    template <typename T>
++    T Read(T def)
++    {
++        if (m_size - m_global_idx < sizeof(T))
++        {
++            return def;
++        }
++        ReadBytes(sizeof(def), reinterpret_cast<char*>(&def));
++        return def;
++    }
++
++    void WriteBytes(totalSize_t size, char const* bytes);
++    void ReadBytes(totalSize_t size, char* bytes);
++    char* ReadBytes(totalSize_t size, bool padStr = false);
++
++private:
++    void incIdx(chunkSize_t amount);
++
++    std::vector<CustomPacketChunk> m_chunks;
++    totalSize_t m_size;
++    chunkSize_t m_maxChunkSize;
++    totalSize_t m_global_idx;
++    chunkSize_t m_idx;
++    chunkCount_t m_chunk;
++    opcode_t m_opcode;
++
++    friend class CustomPacketBuffer;
++};
++
++#endif // CUSTOM_PACKET_BASE_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketBuffer.cpp b/src/server/game/Server/CustomPackets/CustomPacketBuffer.cpp
+new file mode 100644
+index 0000000..05efb09
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketBuffer.cpp
+@@ -0,0 +1,132 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#include "CustomPacketBuffer.h"
++
++CustomPacketBuffer::CustomPacketBuffer(chunkSize_t minFragmentSize, totalSize_t quota, chunkSize_t bufferSize)
++    : m_minFragmentSize(minFragmentSize)
++    , m_maxFragmentSize(bufferSize)
++    , m_quota(quota)
++    , m_cur(0, bufferSize)
++{
++}
++
++CustomPacketBuffer::~CustomPacketBuffer()
++{
++    m_cur.Destroy();
++}
++
++CustomPacketResult CustomPacketBuffer::ReceivePacket(chunkSize_t size, char* data)
++{
++    // Check sizes
++    if (size <= CustomHeaderSize)
++    {
++        return _onError(CustomPacketResult::NO_HEADER, data);
++    }
++
++    if (size > m_maxFragmentSize)
++    {
++        return _onError(CustomPacketResult::TOO_BIG_FRAGMENT, data);
++    }
++
++    if (size + m_cur.Size() > m_quota)
++    {
++        m_cur.Destroy();
++        return _onError(CustomPacketResult::OUT_OF_SPACE, data);
++    }
++
++    CustomPacketChunk chnk(size, data);
++    CustomPacketHeader* hdr = chnk.Header();
++
++    switch (hdr->totalFrags)
++    {
++        case 0:
++            return _onError(CustomPacketResult::INVALID_FRAG_COUNT, data);
++        case 1:
++            AppendFragment(chnk, true);
++            return _onSuccess();
++        default:
++            if (m_cur.ChunkCount() == 0)
++            {
++                if (hdr->fragmentId != 0)
++                {
++                    return _onError(CustomPacketResult::INVALID_FIRST_FRAG, data);
++                }
++
++                if (size < m_minFragmentSize)
++                {
++                    return _onError(CustomPacketResult::TOO_SMALL_FRAGMENT, data);
++                }
++                AppendFragment(chnk, false);
++                return CustomPacketResult::HANDLED_FRAGMENT;
++            }
++            else
++            {
++                CustomPacketHeader* lastH = m_cur.Chunk(m_cur.ChunkCount() - 1)->Header();
++                if (lastH->totalFrags != hdr->totalFrags)
++                {
++                    return _onError(CustomPacketResult::HEADER_MISMATCH, data);
++                }
++
++                if (hdr->fragmentId != lastH->fragmentId + 1)
++                {
++                    return _onError(CustomPacketResult::INVALID_FRAG_ID, data);
++                }
++            }
++
++            if (m_cur.ChunkCount() > 0 && hdr->fragmentId == m_cur.Chunk(0)->Header()->totalFrags - 1)
++            {
++                AppendFragment(chnk, true);
++                return _onSuccess();
++            }
++            else
++            {
++                if (size < m_minFragmentSize)
++                {
++                    return _onError(CustomPacketResult::TOO_SMALL_FRAGMENT, data);
++                }
++                AppendFragment(chnk, false);
++                return CustomPacketResult::HANDLED_FRAGMENT;
++            }
++    }
++}
++
++CustomPacketResult CustomPacketBuffer::_onError(CustomPacketResult error, char* data)
++{
++    OnError(error);
++    m_cur.Destroy();
++    return error;
++}
++
++CustomPacketResult CustomPacketBuffer::_onSuccess()
++{
++    OnPacket(&m_cur);
++
++    // Destroy all but the last fragment, since it's not a copy
++    for (chunkCount_t i = 0; i < m_cur.ChunkCount() - 1; ++i)
++    {
++        m_cur.Chunk(i)->Destroy();
++    }
++    m_cur.Clear();
++    return CustomPacketResult::HANDLED_MESSAGE;
++}
++
++void CustomPacketBuffer::AppendFragment(CustomPacketChunk& chunk, bool isLast)
++{
++    if (isLast)
++    {
++        m_cur.Push(chunk);
++    }
++    else
++    {
++        CustomPacketChunk cpy(chunk);
++        cpy.Copy();
++        m_cur.Push(cpy);
++    }
++}
++
++totalSize_t CustomPacketBuffer::Size()
++{
++    return m_cur.Size();
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketBuffer.h b/src/server/game/Server/CustomPackets/CustomPacketBuffer.h
+new file mode 100644
+index 0000000..8f6d867
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketBuffer.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_BUFFER_H
++#define CUSTOM_PACKET_BUFFER_H
++
++#include "CustomPacketRead.h"
++#include "CustomPacketDefines.h"
++
++enum class CustomPacketResult
++{
++    NO_HEADER            = 0x1,
++    HEADER_MISMATCH      = 0x2,
++    INVALID_FRAG_COUNT   = 0x4,
++    INVALID_FIRST_FRAG   = 0x8,
++    INVALID_FRAG_ID      = 0x10,
++    TOO_SMALL_FRAGMENT   = 0x20,
++    TOO_BIG_FRAGMENT     = 0x40,
++    OUT_OF_SPACE         = 0x80,
++    HANDLED_FRAGMENT     = 0x100,
++    HANDLED_MESSAGE      = 0x200,
++
++    ANY_SUCCESS = HANDLED_FRAGMENT | HANDLED_MESSAGE,
++    ANY_ERROR = NO_HEADER | HEADER_MISMATCH | INVALID_FRAG_COUNT | INVALID_FIRST_FRAG |
++                INVALID_FRAG_ID | TOO_SMALL_FRAGMENT | TOO_BIG_FRAGMENT | OUT_OF_SPACE
++};
++
++class CustomPacketBuffer
++{
++public:
++    CustomPacketBuffer(chunkSize_t minFragmentSize, totalSize_t quota, chunkSize_t bufferSize);
++    ~CustomPacketBuffer();
++
++    CustomPacketResult ReceivePacket(chunkSize_t size, char* data);
++    totalSize_t Size();
++
++protected:
++    virtual void OnPacket(CustomPacketRead* value) { }
++    virtual void OnError(CustomPacketResult error) { }
++
++private:
++    totalSize_t m_quota;
++    chunkSize_t m_minFragmentSize;
++    chunkSize_t m_maxFragmentSize;
++    CustomPacketRead m_cur;
++
++    CustomPacketResult _onError(CustomPacketResult error, char* data);
++    CustomPacketResult _onSuccess();
++    void AppendFragment(CustomPacketChunk& chunk, bool isLast);
++};
++
++#endif // CUSTOM_PACKET_BUFFER_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketChunk.cpp b/src/server/game/Server/CustomPackets/CustomPacketChunk.cpp
+new file mode 100644
+index 0000000..271679b
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketChunk.cpp
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#include "CustomPacketChunk.h"
++#include <cstring>
++
++CustomPacketChunk::CustomPacketChunk(CustomPacketChunk const& other)
++    : m_size(other.m_size)
++    , m_chunk(other.m_chunk)
++{
++}
++
++CustomPacketChunk::CustomPacketChunk(chunkSize_t size, char* chunk)
++    : m_size(size)
++    , m_chunk(chunk)
++{
++}
++
++CustomPacketChunk::CustomPacketChunk(chunkSize_t size)
++    : m_size(size)
++    , m_chunk(new char[size + CustomHeaderSize])
++{
++}
++
++CustomPacketChunk::CustomPacketChunk()
++    : CustomPacketChunk(0, nullptr)
++{
++}
++
++void CustomPacketChunk::Destroy()
++{
++    delete[] m_chunk;
++    m_chunk = nullptr;
++    m_size = 0;
++}
++
++void CustomPacketChunk::Copy()
++{
++    char* old = m_chunk;
++    m_chunk = new char[FullSize()];
++    std::memcpy(m_chunk, old, FullSize());
++}
++
++char* CustomPacketChunk::Data()
++{
++    return m_chunk;
++}
++
++CustomPacketHeader* CustomPacketChunk::Header()
++{
++    return reinterpret_cast<CustomPacketHeader*>(m_chunk);
++}
++
++void CustomPacketChunk::Increase(chunkSize_t size)
++{
++    if (m_chunk == nullptr)
++    {
++        m_chunk = new char[size + CustomHeaderSize];
++        m_size = size;
++    }
++    else
++    {
++        char* old = m_chunk;
++        m_chunk = new char[m_size + size + CustomHeaderSize];
++        std::memcpy(m_chunk, old, m_size + CustomHeaderSize);
++        m_size = m_size + size;
++        delete[] old;
++    }
++}
++
++chunkSize_t CustomPacketChunk::FullSize()
++{
++    return Size() + CustomHeaderSize;
++}
++
++chunkSize_t CustomPacketChunk::Size()
++{
++    return m_size;
++}
++
++chunkSize_t CustomPacketChunk::RemBytes(chunkSize_t idx)
++{
++    return m_size - idx;
++}
++
++char* CustomPacketChunk::Offset(chunkSize_t offset)
++{
++    return m_chunk + CustomHeaderSize + offset;
++}
++
++void CustomPacketChunk::WriteBytes(chunkSize_t idx, chunkSize_t size, char const* value)
++{
++    std::memcpy(Offset(idx), value, size);
++}
++
++void CustomPacketChunk::ReadBytes(chunkSize_t idx, chunkSize_t size, char* out)
++{
++    std::memcpy(out, Offset(idx), size);
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketChunk.h b/src/server/game/Server/CustomPackets/CustomPacketChunk.h
+new file mode 100644
+index 0000000..00592a6
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketChunk.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_CHUNK_H
++#define CUSTOM_PACKET_CHUNK_H
++
++#include "CustomPacketDefines.h"
++#include <cstdint>
++
++class CustomPacketChunk
++{
++public:
++    CustomPacketChunk(CustomPacketChunk const& other);
++    CustomPacketChunk(chunkSize_t size, char* chunk);
++    CustomPacketChunk(chunkSize_t size);
++    CustomPacketChunk();
++
++    void Destroy();
++    void Copy();
++
++    char* Data();
++    CustomPacketHeader* Header();
++
++    void Increase(chunkSize_t size);
++
++    chunkSize_t FullSize();
++    chunkSize_t Size();
++    chunkSize_t RemBytes(chunkSize_t idx);
++
++    char* Offset(chunkSize_t offset);
++
++    void WriteBytes(chunkSize_t idx, chunkSize_t size, char const* value);
++    void ReadBytes(chunkSize_t idx, chunkSize_t size, char* out);
++
++    template<typename T>
++    void Write(chunkSize_t index, T value)
++    {
++        *((T*)(Offset(index))) = value;
++    }
++
++    template<typename T>
++    T Read(chunkSize_t index)
++    {
++        return *((T*)(Offset(index)));
++    }
++
++private:
++    chunkSize_t m_size;
++    char* m_chunk;
++
++    friend class CustomPacketBuffer;
++};
++
++#endif // CUSTOM_PACKET_CHUNK_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketDefines.h b/src/server/game/Server/CustomPackets/CustomPacketDefines.h
+new file mode 100644
+index 0000000..d7f6d72
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketDefines.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_DEFINES_H
++#define CUSTOM_PACKET_DEFINES_H
++
++#include <cstdint>
++
++// Type definitions matching tswow
++typedef uint16_t opcode_t;
++typedef uint32_t totalSize_t;
++typedef uint16_t chunkSize_t;
++typedef uint16_t chunkCount_t;
++
++constexpr totalSize_t TotalSizeNpos = UINT16_MAX;
++
++// The maximum size of a single packet fragment
++constexpr chunkSize_t MAX_FRAGMENT_SIZE = 30000;
++constexpr chunkSize_t MIN_FRAGMENT_SIZE = 25000;
++
++// Default buffer quota: ~8MB per player
++constexpr totalSize_t BUFFER_QUOTA = 8000000;
++
++// Transport opcodes (base WoW protocol opcodes)
++// Server -> Client: using 0x102 (repurposed CMSG)
++// Client -> Server: using 0x51F (custom opcode)
++constexpr uint16_t SERVER_TO_CLIENT_OPCODE = 0x102;
++constexpr uint16_t CLIENT_TO_SERVER_OPCODE = 0x51F;
++
++// Header structure (packed)
++#pragma pack(push, 1)
++struct CustomPacketHeader
++{
++    chunkCount_t fragmentId;
++    chunkCount_t totalFrags;
++    opcode_t opcode;
++};
++#pragma pack(pop)
++
++#define CustomHeaderSize chunkSize_t(sizeof(CustomPacketHeader))
++
++#endif // CUSTOM_PACKET_DEFINES_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketHandler.cpp b/src/server/game/Server/CustomPackets/CustomPacketHandler.cpp
+new file mode 100644
+index 0000000..a36cc56
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketHandler.cpp
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ *
++ * TrinityCore integration for Custom Packets
++ */
++
++#include "CustomPacketHandler.h"
++#include "Log.h"
++#include "Player.h"
++#include "ScriptMgr.h"
++#include "WorldPacket.h"
++#include "WorldSession.h"
++
++// ============================================================================
++// SessionCustomPacketBuffer
++// ============================================================================
++
++SessionCustomPacketBuffer::SessionCustomPacketBuffer()
++    : CustomPacketBuffer(MIN_FRAGMENT_SIZE, BUFFER_QUOTA, MAX_FRAGMENT_SIZE)
++    , m_session(nullptr)
++{
++}
++
++void SessionCustomPacketBuffer::OnPacket(CustomPacketRead* packet)
++{
++    if (!m_session)
++    {
++        return;
++    }
++
++    Player* player = m_session->GetPlayer();
++    if (!player)
++    {
++        return;
++    }
++
++    // Extract opcode from the first chunk's header
++    opcode_t opcode = 0;
++    if (packet->ChunkCount() > 0)
++    {
++        CustomPacketChunk* firstChunk = packet->Chunk(0);
++        if (firstChunk)
++        {
++            CustomPacketHeader* header = firstChunk->Header();
++            if (header)
++            {
++                opcode = header->opcode;
++            }
++        }
++    }
++
++    // Fire script hook
++    sScriptMgr->OnCustomPacketReceive(player, opcode, packet);
++}
++
++void SessionCustomPacketBuffer::OnError(CustomPacketResult error)
++{
++    uint32_t errorCode = static_cast<uint32_t>(error);
++
++    if (m_session && m_session->GetPlayer())
++    {
++        TC_LOG_ERROR("network.custom", "CustomPacket error: player={}, error=0x{:x}",
++                     m_session->GetPlayer()->GetName(), errorCode);
++    }
++    else
++    {
++        TC_LOG_ERROR("network.custom", "CustomPacket error: error=0x{:x}", errorCode);
++    }
++}
++
++// ============================================================================
++// Handler Functions
++// ============================================================================
++
++void HandleCustomPacketOpcode(WorldSession* session, WorldPacket& packet, SessionCustomPacketBuffer& buffer)
++{
++    if (!session)
++    {
++        return;
++    }
++
++    Player* player = session->GetPlayer();
++    if (!player)
++    {
++        return;
++    }
++
++    if (packet.size() < CustomHeaderSize)
++    {
++        return;
++    }
++
++    // Set the session on the buffer
++    buffer.SetSession(session);
++
++    // Get raw packet data (WorldPacket's read position should be at start)
++    chunkSize_t size = static_cast<chunkSize_t>(packet.size());
++
++    // We need to copy the data since CustomPacketBuffer expects ownership
++    char* data = new char[size];
++    packet.read(reinterpret_cast<uint8_t*>(data), size);
++
++    // Reset packet read position for potential re-reads
++    packet.rfinish();
++
++    // Process the fragment
++    CustomPacketResult result = buffer.ReceivePacket(size, data);
++
++    // If it wasn't the last fragment, data was copied internally, so we can delete
++    // If it was a single fragment or last fragment, OnPacket was called and we can delete
++    if (result != CustomPacketResult::HANDLED_MESSAGE)
++    {
++        // For partial messages, buffer made a copy
++        delete[] data;
++    }
++    // For complete messages, the buffer owns the last chunk's data until Clear()
++    // which happens in _onSuccess(), so data will be cleaned up there
++}
++
++void SendCustomPacket(Player* player, CustomPacketWrite& writer)
++{
++    if (!player)
++        return;
++
++    WorldSession* session = player->GetSession();
++    if (!session)
++        return;
++
++    SendCustomPacket(session, writer);
++}
++
++void SendCustomPacket(WorldSession* session, CustomPacketWrite& writer)
++{
++    if (!session)
++        return;
++
++    // Build the messages (sets headers)
++    std::vector<CustomPacketChunk>& chunks = writer.buildMessages();
++
++    TC_LOG_DEBUG("network.custom", "SendCustomPacket: opcode={}, chunks={}, totalSize={}",
++                 writer.Opcode(), chunks.size(), writer.Size());
++
++    // Send each chunk as a separate packet
++    for (auto& chunk : chunks)
++    {
++        WorldPacket packet(SERVER_TO_CLIENT_OPCODE, chunk.FullSize());
++        packet.append(reinterpret_cast<uint8_t*>(chunk.Data()), chunk.FullSize());
++        session->SendPacket(&packet);
++
++        TC_LOG_TRACE("network.custom", "SendCustomPacket: Sent chunk fragId={}, totalFrags={}, size={}",
++                     chunk.Header()->fragmentId, chunk.Header()->totalFrags, chunk.FullSize());
++    }
++}
++
++CustomPacketWrite CreateCustomPacket(opcode_t opcode)
++{
++    return CustomPacketWrite(opcode, MAX_FRAGMENT_SIZE, 0);
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketHandler.h b/src/server/game/Server/CustomPackets/CustomPacketHandler.h
+new file mode 100644
+index 0000000..650a594
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketHandler.h
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ *
++ * TrinityCore integration for Custom Packets
++ */
++
++#ifndef CUSTOM_PACKET_HANDLER_H
++#define CUSTOM_PACKET_HANDLER_H
++
++#include "CustomPacketBuffer.h"
++#include "CustomPacketWrite.h"
++#include "CustomPacketRead.h"
++
++class Player;
++class WorldSession;
++class WorldPacket;
++
++/**
++ * Per-session packet buffer that handles fragment reassembly
++ * and dispatches complete packets to the script hook
++ */
++class SessionCustomPacketBuffer : public CustomPacketBuffer
++{
++public:
++    SessionCustomPacketBuffer();
++
++    void SetSession(WorldSession* session) { m_session = session; }
++    WorldSession* GetSession() const { return m_session; }
++
++protected:
++    void OnPacket(CustomPacketRead* packet) override;
++    void OnError(CustomPacketResult error) override;
++
++private:
++    WorldSession* m_session;
++};
++
++/**
++ * Handle incoming custom packet from client
++ * Called by WorldSession::HandleCustomPacket
++ */
++void HandleCustomPacketOpcode(WorldSession* session, WorldPacket& packet, SessionCustomPacketBuffer& buffer);
++
++/**
++ * Send a custom packet to a player
++ * Handles automatic fragmentation for large packets
++ */
++void SendCustomPacket(Player* player, CustomPacketWrite& writer);
++void SendCustomPacket(WorldSession* session, CustomPacketWrite& writer);
++
++/**
++ * Create a writer with the default chunk size
++ */
++CustomPacketWrite CreateCustomPacket(opcode_t opcode);
++
++#endif // CUSTOM_PACKET_HANDLER_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketRead.cpp b/src/server/game/Server/CustomPackets/CustomPacketRead.cpp
+new file mode 100644
+index 0000000..bb625a4
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketRead.cpp
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#include "CustomPacketRead.h"
++#include "CustomPacketWrite.h"
++
++CustomPacketRead::CustomPacketRead()
++    : CustomPacketBase()
++{
++}
++
++CustomPacketRead::CustomPacketRead(opcode_t opcode, chunkSize_t chunkSize)
++    : CustomPacketBase(opcode, chunkSize, 0)
++{
++}
++
++CustomPacketRead::CustomPacketRead(CustomPacketWrite const& write)
++    : CustomPacketBase(write)
++{
++}
++
++CustomPacketRead* CustomPacketRead::operator->()
++{
++    return this;
++}
++
++std::string CustomPacketRead::ReadString(std::string const& def)
++{
++    totalSize_t size = Read<totalSize_t>(TotalSizeNpos);
++    if (size == TotalSizeNpos) return def;
++    if (size == 0) return "";
++    char* chr = ReadBytes(size, true);
++    if (chr == nullptr) return def;
++    chr[size] = '\0';
++    std::string str(chr);
++    delete[] chr;
++    return str;
++}
++
++char* CustomPacketRead::ReadBytes(totalSize_t size, bool padStr)
++{
++    return CustomPacketBase::ReadBytes(size, padStr);
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketRead.h b/src/server/game/Server/CustomPackets/CustomPacketRead.h
+new file mode 100644
+index 0000000..991e211
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketRead.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_READ_H
++#define CUSTOM_PACKET_READ_H
++
++#include "CustomPacketDefines.h"
++#include "CustomPacketBase.h"
++#include <string>
++
++class CustomPacketWrite;
++
++class CustomPacketRead : public CustomPacketBase
++{
++public:
++    CustomPacketRead();
++    CustomPacketRead(opcode_t opcode, chunkSize_t chunkSize);
++    CustomPacketRead(CustomPacketWrite const& write);
++    CustomPacketRead* operator->();
++
++    std::string ReadString(std::string const& def = "");
++
++    template<typename T>
++    T Read(T def)
++    {
++        return CustomPacketBase::Read(def);
++    }
++
++    char* ReadBytes(totalSize_t size, bool padStr = false);
++};
++
++#endif // CUSTOM_PACKET_READ_H
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketWrite.cpp b/src/server/game/Server/CustomPackets/CustomPacketWrite.cpp
+new file mode 100644
+index 0000000..d1c374a
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketWrite.cpp
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#include "CustomPacketWrite.h"
++#include <cstring>
++
++CustomPacketWrite::CustomPacketWrite(opcode_t opcode, chunkSize_t chunkSize, totalSize_t size)
++    : CustomPacketBase(opcode, chunkSize, size)
++{
++}
++
++CustomPacketWrite::CustomPacketWrite()
++    : CustomPacketBase()
++{
++}
++
++CustomPacketWrite* CustomPacketWrite::operator->()
++{
++    return this;
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteString(std::string const& str)
++{
++    return WriteString(str, static_cast<totalSize_t>(str.size()));
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteString(const char* str)
++{
++    return WriteString(str, static_cast<totalSize_t>(std::strlen(str)));
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteString(std::string const& str, totalSize_t length)
++{
++    return WriteString(str.c_str(), length);
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteString(const char* chr, totalSize_t length)
++{
++    Write<totalSize_t>(length);
++    WriteBytes(length, chr);
++    return this;
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteStringNullTerm(std::string const& str, totalSize_t length)
++{
++    return WriteStringNullTerm(str.c_str(), length);
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteStringNullTerm(const char* chr, totalSize_t length)
++{
++    WriteBytes(length, chr);
++    Write<uint8_t>(0);
++    return this;
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteStringNullTerm(std::string const& str)
++{
++    return WriteStringNullTerm(str, static_cast<totalSize_t>(str.size()));
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteStringNullTerm(const char* chr)
++{
++    return WriteStringNullTerm(chr, static_cast<totalSize_t>(std::strlen(chr)));
++}
++
++CustomPacketWrite* CustomPacketWrite::WriteBytes(totalSize_t size, char const* bytes)
++{
++    CustomPacketBase::WriteBytes(size, bytes);
++    return this;
++}
+diff --git a/src/server/game/Server/CustomPackets/CustomPacketWrite.h b/src/server/game/Server/CustomPackets/CustomPacketWrite.h
+new file mode 100644
+index 0000000..bfd0745
+--- /dev/null
++++ b/src/server/game/Server/CustomPackets/CustomPacketWrite.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (C) Thorium Project - Based on tswow CustomPackets
++ */
++
++#ifndef CUSTOM_PACKET_WRITE_H
++#define CUSTOM_PACKET_WRITE_H
++
++#include "CustomPacketDefines.h"
++#include "CustomPacketBase.h"
++#include <string>
++
++class CustomPacketWrite : public CustomPacketBase
++{
++public:
++    CustomPacketWrite(opcode_t opcode, chunkSize_t chunkSize, totalSize_t size = 0);
++    CustomPacketWrite();
++    CustomPacketWrite* operator->();
++
++    CustomPacketWrite* WriteString(std::string const& str, totalSize_t length);
++    CustomPacketWrite* WriteString(std::string const& str);
++    CustomPacketWrite* WriteString(const char* str);
++    CustomPacketWrite* WriteString(const char* chr, totalSize_t length);
++
++    CustomPacketWrite* WriteStringNullTerm(std::string const& str);
++    CustomPacketWrite* WriteStringNullTerm(const char* chr);
++    CustomPacketWrite* WriteStringNullTerm(std::string const& str, totalSize_t length);
++    CustomPacketWrite* WriteStringNullTerm(const char* chr, totalSize_t length);
++
++    template <typename T>
++    CustomPacketWrite* Write(T value)
++    {
++        CustomPacketBase::Write(value);
++        return this;
++    }
++
++    CustomPacketWrite* WriteBytes(totalSize_t size, char const* bytes);
++};
++
++#endif // CUSTOM_PACKET_WRITE_H
+diff --git a/src/server/game/Server/Protocol/Opcodes.cpp b/src/server/game/Server/Protocol/Opcodes.cpp
+index 1364387..006d299 100644
+--- a/src/server/game/Server/Protocol/Opcodes.cpp
++++ b/src/server/game/Server/Protocol/Opcodes.cpp
+@@ -1439,6 +1439,7 @@ void OpcodeTable::Initialize()
+     /*0x51C*/ DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_SKIRMISH_QUEUE_RESULT1, STATUS_NEVER);
+     /*0x51D*/ DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_SKIRMISH_QUEUE_RESULT2, STATUS_NEVER);
+     /*0x51E*/ DEFINE_SERVER_OPCODE_HANDLER(SMSG_MULTIPLE_MOVES,   STATUS_NEVER);
++    /*0x51F*/ DEFINE_HANDLER(CMSG_CUSTOM_PACKET,                  STATUS_LOGGEDIN, PROCESS_INPLACE, &WorldSession::HandleCustomPacket);
+ 
+ #undef DEFINE_HANDLER
+ 
+diff --git a/src/server/game/Server/Protocol/Opcodes.h b/src/server/game/Server/Protocol/Opcodes.h
+index 47d6264..55c74b0 100644
+--- a/src/server/game/Server/Protocol/Opcodes.h
++++ b/src/server/game/Server/Protocol/Opcodes.h
+@@ -1337,7 +1337,8 @@ enum Opcodes : uint16
+     SMSG_COMMENTATOR_SKIRMISH_QUEUE_RESULT1         = 0x51C,
+     SMSG_COMMENTATOR_SKIRMISH_QUEUE_RESULT2         = 0x51D,
+     SMSG_MULTIPLE_MOVES                             = 0x51E, // uncompressed version of SMSG_COMPRESSED_MOVES
+-    NUM_MSG_TYPES                                   = 0x51F
++    CMSG_CUSTOM_PACKET                              = 0x51F, // Custom packet from client addon (Thorium)
++    NUM_MSG_TYPES                                   = 0x520
+ };
+ 
+ enum OpcodeMisc : uint16
+diff --git a/src/server/game/Server/WorldSession.cpp b/src/server/game/Server/WorldSession.cpp
+index 2514d31..4557194 100644
+--- a/src/server/game/Server/WorldSession.cpp
++++ b/src/server/game/Server/WorldSession.cpp
+@@ -1782,3 +1782,9 @@ bool WorldSession::IsRightUnitBeingMoved(ObjectGuid guid)
+ 
+     return true;
+ }
++
++// Custom Packets (Thorium)
++void WorldSession::HandleCustomPacket(WorldPacket& recvPacket)
++{
++    HandleCustomPacketOpcode(this, recvPacket, _customPacketBuffer);
++}
+diff --git a/src/server/game/Server/WorldSession.h b/src/server/game/Server/WorldSession.h
+index 38e1be9..4647285 100644
+--- a/src/server/game/Server/WorldSession.h
++++ b/src/server/game/Server/WorldSession.h
+@@ -24,6 +24,7 @@
+ 
+ #include "Common.h"
+ #include "AsyncCallbackProcessor.h"
++#include "CustomPacketHandler.h"
+ #include "AuthDefines.h"
+ #include "DatabaseEnvFwd.h"
+ #include "Duration.h"
+@@ -1192,6 +1193,9 @@ class TC_GAME_API WorldSession
+         void HandleUpdateProjectilePosition(WorldPacket& recvPacket);
+         void HandleUpdateMissileTrajectory(WorldPacket& recvPacket);
+ 
++        // Custom Packets (Thorium)
++        void HandleCustomPacket(WorldPacket& recvPacket);
++
+     public:
+         QueryCallbackProcessor& GetQueryProcessor() { return _queryProcessor; }
+         TransactionCallback& AddTransactionCallback(TransactionCallback&& callback);
+@@ -1204,6 +1208,9 @@ class TC_GAME_API WorldSession
+         AsyncCallbackProcessor<TransactionCallback> _transactionCallbacks;
+         AsyncCallbackProcessor<SQLQueryHolderCallback> _queryHolderProcessor;
+ 
++        // Custom Packets (Thorium)
++        SessionCustomPacketBuffer _customPacketBuffer;
++
+     friend class World;
+     protected:
+         class DosProtection

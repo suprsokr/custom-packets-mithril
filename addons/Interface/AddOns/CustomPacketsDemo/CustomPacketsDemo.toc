@@ -1,0 +1,8 @@
+## Interface: 30300
+## Title: CustomPackets Demo
+## Notes: Demo addon showing custom packet usage
+## Author: Suprsokr
+## Version: 1.0.0
+## Dependencies:
+
+CustomPacketsDemo.lua

@@ -58,4 +58,4 @@ Refer to [custom-packets.md](custom-packets.md) for how to make your own custom 
 
 ## Credits
 
-- ClientExtensions.dll from [wotlk-custom-packets](https://github.com/suprsokr/wotlk-custom-packets), based on [TSWoW](https://github.com/tswow/tswow) (MIT License)
+- ClientExtensions.dll from [wotlk-custom-packets](https://github.com/suprsokr/wotlk-custom-packets), based on [Alyst3r's WotLK-Extensions](https://github.com/Alyst3r/WotLK-Extensions) (MIT) and [TSWoW](https://github.com/tswow/tswow) (MIT License)
